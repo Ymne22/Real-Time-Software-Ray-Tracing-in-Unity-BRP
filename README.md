@@ -89,6 +89,7 @@ If enabled, each frame's result is blended with prior frames to reduce noise. Co
 
 ## Limitations
 
+* It only support Build-in Render Pipeline, URP and HDRP not supported
 * No caustics or path-traced energy conservation
 * Transparency is basic (alpha only)
 * No support for dynamic mesh deformation or skinning
