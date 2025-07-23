@@ -65,7 +65,7 @@ If enabled, each frame's result is blended with prior frames to reduce noise. Co
 | Texture Sampling          | ✅            | Uses `Texture2DArray` for batched material maps.                     |
 | Shadows                   | ✅ (partial) | Ray-traced for directional lights only. Can be extended to other light types. |
 | Raster Fallback Composing | ✅            | Blends raster and ray-traced output.                                 |
-| Denoiser                  | ❌            | Uses temporal denoiser for static scenes only. Spatial denoiser can be added if needed. |
+| Advanced Denoiser         | ❌            | Uses temporal denoiser for static scenes only. Spatial denoiser can be added if needed. |
 
 ---
 
