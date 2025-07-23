@@ -1,0 +1,505 @@
+// RayTracing.compute
+#pragma kernel CSMain
+#include "RayTracingCommon.hlsl"
+
+// Input Buffers
+StructuredBuffer<MeshObject> _MeshObjects;
+StructuredBuffer<float3> _Vertices;
+StructuredBuffer<float3> _Normals;
+StructuredBuffer<float4> _Tangents;
+StructuredBuffer<float2> _UVs;
+StructuredBuffer<int3> _Indices;
+StructuredBuffer<MaterialData> _Materials;
+StructuredBuffer<BVHNode> _BVH;
+StructuredBuffer<Light> _Lights;
+Texture2DArray _TextureArray;
+SamplerState sampler_LinearRepeat;
+Texture2D<float4> _RasterizedScene;
+
+// Output Texture
+RWTexture2D<float4> Result;
+
+// Uniforms
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+int _ObjectCount;
+int _MaterialCount;
+int _TextureCount;
+int _LightCount;
+
+// Toggles and State
+bool _UseTemporalCapture;
+bool _UseSmoothShading;
+bool _UseTextures;
+bool _CombineWithRasterize;
+bool _EnableReflection;
+bool _EnableRayTraceDirectLight;
+bool _EnableRayTraceIndirectLight;
+bool _EnableAmbientOcclusion;
+int _FrameIndex;
+int _MaxBounces;
+int _SamplesPerPixel;
+
+// Procedural Sky Uniforms
+float3 _DayZenithColor;
+float3 _DayHorizonColor;
+float3 _NightZenithColor;
+float3 _NightHorizonColor;
+float3 _SunLightDirection;
+
+
+// --- Helper Functions ---
+
+uint wang_hash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+float NextRand(inout uint state)
+{
+    state = wang_hash(state);
+    return float(state) / 4294967296.0;
+}
+
+
+uint Hash(uint seed)
+{
+    seed ^= 2747636419u;
+    seed *= 2654435769u;
+    seed ^= seed >> 16;
+    seed *= 2654435769u;
+    seed ^= seed >> 16;
+    seed *= 2654435769u;
+    return seed;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    float3 origin = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0)).xyz;
+    direction = normalize(direction);
+    Ray r = { origin, direction };
+    return r;
+}
+
+bool IntersectTriangle(float3 rayOrigin, float3 rayDir, float3 v0, float3 v1, float3 v2, out float t, out float u, out float v)
+{
+    static const float EPSILON = 1e-6;
+
+    float3 edge1 = v1 - v0;
+    float3 edge2 = v2 - v0;
+
+    float3 pvec = cross(rayDir, edge2);
+    float det = dot(edge1, pvec);
+
+    if (det < EPSILON)
+    {
+        t = u = v = 0;
+        return false;
+    }
+
+    float invDet = 1.0 / det;
+    float3 tvec = rayOrigin - v0;
+
+    u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0)
+    {
+        t = v = 0;
+        return false;
+    }
+
+    float3 qvec = cross(tvec, edge1);
+    v = dot(rayDir, qvec) * invDet;
+    if (v < 0.0 || (u + v) > 1.0)
+    {
+        t = 0;
+        return false;
+    }
+
+    t = dot(edge2, qvec) * invDet;
+    return t > EPSILON;
+}
+
+bool IntersectAABB(Ray ray, float3 aabb_min, float3 aabb_max, out float t)
+{
+    float3 invD = 1.0 / ray.direction;
+    float3 t0s = (aabb_min - ray.origin) * invD;
+    float3 t1s = (aabb_max - ray.origin) * invD;
+    float3 tmin = min(t0s, t1s);
+    float3 tmax = max(t0s, t1s);
+    
+    float tmin_max = max(tmin.x, max(tmin.y, tmin.z));
+    float tmax_min = min(tmax.x, min(tmax.y, tmax.z));
+    
+    t = tmin_max;
+    return (tmin_max <= tmax_min) && (tmax_min >= 0);
+}
+
+// --- BVH Traversal ---
+HitInfo Trace(Ray ray)
+{
+    HitInfo bestHit;
+    bestHit.distance = 1.#INF;
+    bestHit.materialIndex = -1;
+    bestHit.position = 0; bestHit.normal = 0; bestHit.uv = 0;
+
+    uint stack[256];
+    uint stackPtr = 0;
+    stack[stackPtr++] = 0;
+
+    while (stackPtr > 0)
+    {
+        uint nodeIndex = stack[--stackPtr];
+        BVHNode node = _BVH[nodeIndex];
+
+        float t_box;
+        if (!IntersectAABB(ray, node.aabb_min, node.aabb_max, t_box) || t_box >= bestHit.distance) continue;
+
+        if (node.object_count > 0)
+        {
+            for (int i = 0; i < node.object_count; i++)
+            {
+                uint objectIndex = node.first_child_or_object_index + i;
+                MeshObject obj = _MeshObjects[objectIndex];
+
+                Ray localRay = { mul(obj.worldToLocalMatrix, float4(ray.origin, 1)).xyz, mul(obj.worldToLocalMatrix, float4(ray.direction, 0)).xyz };
+
+                for (uint j = 0; j < obj.indices_count; j++)
+                {
+                    int3 indices = _Indices[obj.indices_offset + j];
+                    Triangle localTri = { _Vertices[indices.x], _Vertices[indices.y], _Vertices[indices.z] };
+
+                    float t_tri, u, v;
+                    if (IntersectTriangle(localRay.origin, localRay.direction,
+                      localTri.v0, localTri.v1, localTri.v2,
+                      t_tri, u, v) && t_tri < bestHit.distance)
+                    {
+                        bestHit.distance = t_tri;
+                        bestHit.materialIndex = obj.materialIndex;
+                        bestHit.position = ray.origin + t_tri * ray.direction;
+                        float w = 1.0f - u - v;
+                        bestHit.uv = _UVs[indices.x] * w + _UVs[indices.y] * u + _UVs[indices.z] * v;
+
+                        float3 localNormal = cross(localTri.v1 - localTri.v0, localTri.v2 - localTri.v0);
+                        float4 localTangent = float4(1,0,0,1);
+
+                        if (_UseSmoothShading) {
+                            localNormal = _Normals[indices.x] * w + _Normals[indices.y] * u + _Normals[indices.z] * v;
+                            localTangent = _Tangents[indices.x] * w + _Tangents[indices.y] * u + _Tangents[indices.z] * v;
+                        }
+
+                        bestHit.normal = normalize(mul(obj.localToWorldMatrix, float4(localNormal, 0)).xyz);
+                        bestHit.tangent = float4(normalize(mul(obj.localToWorldMatrix, float4(localTangent.xyz, 0)).xyz),localTangent.w);
+                        bestHit.bitangent = normalize(cross(bestHit.normal, bestHit.tangent) * localTangent.w);
+                    }
+                }
+            }
+        }
+        else
+        {
+            stack[stackPtr++] = node.first_child_or_object_index + 1;
+            stack[stackPtr++] = node.first_child_or_object_index;
+        }
+    }
+    return bestHit;
+}
+
+
+// --- Material & Shading Functions ---
+
+float3 SampleTexture(int textureIndex, float2 uv, float2 scale, float2 offset)
+{
+    if (!_UseTextures || textureIndex < 0 || textureIndex >= _TextureCount) return float3(1, 1, 1);
+    return _TextureArray.SampleLevel(sampler_LinearRepeat, float3(uv * scale + offset, textureIndex), 0).rgb;
+}
+
+// Applies normal map if available, as a note, normalmaps not work properly on this code
+float3 GetNormal(MaterialData mat, HitInfo hit)
+{
+    if (mat.normalIndex < 0 || !_UseTextures)
+        return normalize(hit.normal);
+    float3 texNormal = _TextureArray.SampleLevel(sampler_LinearRepeat, 
+                   float3(hit.uv * mat.textureScale + mat.textureOffset, mat.normalIndex), 0).rgb;
+
+    float3 tangentNormal;
+    tangentNormal.xy = texNormal.xy * 2.0 - 1.0;
+    tangentNormal.y = -tangentNormal.y;
+    tangentNormal.z = sqrt(1.0 - saturate(dot(tangentNormal.xy, tangentNormal.xy)));
+
+    float3 N = normalize(hit.normal);
+    float3 T = normalize(hit.tangent.xyz - dot(hit.tangent.xyz, N) * N);
+    float3 B = cross(N, T) * sign(hit.tangent.w);
+    
+    return normalize(tangentNormal.x * T + tangentNormal.y * B + tangentNormal.z * N);
+}
+
+float3 GetMaterialAlbedo(MaterialData mat, float2 uv)
+{
+    return mat.albedo * SampleTexture(mat.textureIndex, uv, mat.textureScale, mat.textureOffset);
+}
+
+float GetMaterialMetallic(MaterialData mat, float2 uv)
+{
+    if (mat.metallicIndex < 0) return mat.specular.x;
+    return SampleTexture(mat.metallicIndex, uv, mat.textureScale, mat.textureOffset).r;
+}
+
+float3 SampleSky(float3 direction)
+{
+    // Sky gradient
+    float t = saturate(direction.y);
+    float3 day_sky = lerp(_DayHorizonColor, _DayZenithColor, t);
+    float3 night_sky = lerp(_NightHorizonColor, _NightZenithColor, t);
+
+    // Day-night cycle interpolation based on sun direction
+    float day_factor = saturate(dot(float3(0, 1, 0), -_SunLightDirection));
+    float3 sky = lerp(night_sky, day_sky, day_factor);
+
+    // Sun
+    float sun_dot = dot(direction, -_SunLightDirection);
+    float sun_disk = pow(saturate(sun_dot), 1024.0);
+    float sun_glow = pow(saturate(sun_dot), 4.0);
+    float3 sun_color = float3(1.0, 0.95, 0.85);
+    
+    // Add sun, but only when it's above the horizon
+    if (_SunLightDirection.y < 0)
+    {
+        sky += (sun_color * 2.0 * sun_disk + sun_color * 0.4 * sun_glow) * day_factor;
+    }
+
+    // Night factor
+    float night_factor = 1.0 - day_factor;
+
+    return sky;
+}
+
+float3 Shade(inout Ray ray, HitInfo hit, inout float3 throughput, inout uint rand_state)
+{
+    if (hit.materialIndex < 0 || hit.materialIndex >= _MaterialCount) 
+        return float3(0, 0, 0);
+    
+    MaterialData mat = _Materials[hit.materialIndex];
+    float3 albedo = GetMaterialAlbedo(mat, hit.uv);
+    float metallic = GetMaterialMetallic(mat, hit.uv);
+    float roughness = mat.specular.y;
+    float3 normal = GetNormal(mat, hit);
+
+    // Handle transparency
+    if (mat.transparency > 0.0 && NextRand(rand_state) < mat.transparency)
+    {
+        ray.origin = hit.position + normal * 0.001f;
+        throughput *= albedo; 
+        return float3(0, 0, 0);
+    }
+
+    // --- Direct Lighting ---
+    float3 directLighting = float3(0, 0, 0);
+    if (_EnableRayTraceDirectLight && _LightCount > 0)
+    {
+        int lightIndex = min(int(NextRand(rand_state) * _LightCount), _LightCount - 1);
+        Light light = _Lights[lightIndex];
+
+        if (light.type == 0) // Directional, It still limited on directional lights only, other types can be added later
+        {
+            float3 lightDir = -light.direction;
+            float NdotL = saturate(dot(normal, lightDir));
+            
+            if (NdotL > 0)
+            {
+                float3 offsetPos = hit.position + normal * 0.001f;
+                Ray shadowRay = { offsetPos, lightDir };
+                HitInfo shadowHit = Trace(shadowRay);
+                
+                if (shadowHit.distance >= 1.#INF)
+                {
+                    float3 viewDir = normalize(-ray.direction);
+                    float3 halfVec = normalize(lightDir + viewDir);
+                    float NdotH = saturate(dot(normal, halfVec));
+                    float NdotV = saturate(dot(normal, viewDir));
+                    
+                    // BRDF components
+                    float alpha = roughness * roughness;
+                    float alpha2 = alpha * alpha;
+                    
+                    // Normal distribution (GGX/Trowbridge-Reitz)
+                    float denom = (NdotH * NdotH) * (alpha2 - 1.0) + 1.0;
+                    float D = alpha2 / (3.14159265359 * denom * denom);
+                    
+                    // Fresnel (Schlick approximation)
+                    float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
+                    float3 F = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+                    
+                    // Geometry term (Smith GGX)
+                    float k = (alpha + 1.0) * (alpha + 1.0) / 8.0;
+                    float G1 = NdotV / (NdotV * (1.0 - k) + k);
+                    float G2 = NdotL / (NdotL * (1.0 - k) + k);
+                    float G = G1 * G2;
+                    
+                    // Combine terms
+                    float3 specular = (D * G * F) / (4.0 * NdotL * NdotV + 0.0001);
+                    float3 diffuse = lerp(albedo / 3.14159265359, float3(0, 0, 0), metallic);
+                    
+                    directLighting += (diffuse + specular) * NdotL * light.color * light.intensity * _LightCount;
+                }
+            }
+        }
+    }
+
+    // --- Indirect Lighting ---
+    ray.origin = hit.position + normal * 0.001f;
+    
+    if (_EnableRayTraceIndirectLight)
+    {
+        float3 dir;
+        float r1 = NextRand(rand_state);
+        float r2 = NextRand(rand_state);
+        
+        // Importance sampling based on material properties
+        if (r1 < metallic) // Specular bounce
+        {
+            // GGX distribution for rough surfaces
+            float alpha = roughness * roughness;
+            float phi = 2.0 * 3.14159265359 * r2;
+            float cosTheta = sqrt((1.0 - r1) / (1.0 + (alpha * alpha - 1.0) * r1));
+            float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+            
+            float3 halfVec;
+            halfVec.x = sinTheta * cos(phi);
+            halfVec.y = sinTheta * sin(phi);
+            halfVec.z = cosTheta;
+            
+            // Transform from tangent to world space
+            float3 tangent = normalize(cross(normal, 
+                                   abs(normal.x) > 0.5 ? float3(0,1,0) : float3(1,0,0)));
+            float3 bitangent = cross(normal, tangent);
+            halfVec = normalize(halfVec.x * tangent + halfVec.y * bitangent + halfVec.z * normal);
+            
+            // Reflect view direction
+            dir = reflect(ray.direction, halfVec);
+            
+            // Fresnel term affects throughput
+            float3 viewDir = normalize(-ray.direction);
+            float NdotV = saturate(dot(normal, viewDir));
+            float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic);
+            float3 F = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+            throughput *= F;
+        }
+        else // Diffuse bounce
+        {
+            // Cosine-weighted hemisphere sampling
+            float sinTheta = sqrt(1.0 - r1 * r1);
+            float phi = 2.0 * 3 * r2;
+            
+            float3 tangent = normalize(cross(normal, 
+                                   abs(normal.x) > 0.5 ? float3(0,1,0) : float3(1,0,0)));
+            float3 bitangent = cross(normal, tangent);
+            
+            dir = normalize(r1 * normal +
+                          sinTheta * cos(phi) * tangent +
+                          sinTheta * sin(phi) * bitangent);
+            
+            throughput *= albedo * (1.0 - metallic);
+        }
+        
+        ray.direction = dir;
+    }
+    else
+    {
+        throughput = 0;
+    }
+    
+    return directLighting + mat.emission;
+}
+
+float3 PathTrace(Ray ray, uint2 pixelCoord, inout uint rand_state)
+{
+    float3 color = _CombineWithRasterize ? _RasterizedScene.Load(int3(pixelCoord, 0)).rgb : float3(0, 0, 0);
+    float3 throughput = 1;
+
+    for (int bounce = 0; bounce < _MaxBounces; bounce++)
+    {
+        HitInfo hit = Trace(ray);
+        if (hit.distance >= 1.#INF)
+        {
+            color += throughput * SampleSky(ray.direction);
+            break;
+        }
+
+        if (_EnableAmbientOcclusion && bounce == 0)
+        {
+            float3 aoDir = normalize(hit.normal + float3(NextRand(rand_state)*2-1, NextRand(rand_state)*2-1, NextRand(rand_state)*2-1));
+            Ray aoRay = { hit.position + hit.normal * 0.001f, aoDir };
+            HitInfo aoHit = Trace(aoRay);
+            
+            float aoFactor = (aoHit.distance < 2.0f) ? (0 - aoHit.distance / 1) : 1.0;
+            throughput *= lerp(0.1, 1.0, aoFactor);
+            
+        }
+        color += throughput * Shade(ray, hit, throughput, rand_state);
+
+        // --- Russian Roulette ---
+        // After a few bounces, it can start randomly terminating paths.
+        // This is done to avoid cutting off important paths for direct lighting and primary reflections.
+        if (bounce >= 3)
+        {
+            float survivalProbability = max(0.05f, maxComponent(throughput));
+            if (NextRand(rand_state) > survivalProbability)
+            {
+                break;
+            }
+
+            // If the path survives, it boost its throughput to compensate for the terminated paths.
+            // This ensures the final render remains unbiased.
+            throughput /= survivalProbability;
+        }
+        
+        // A hard check to prevent infinite loops or NaNs if throughput becomes very small.
+        if (maxComponent(throughput) < 0.001f)
+        {
+             break;
+        }
+    }
+
+    return color;
+}
+
+
+// --- Main Compute Shader Entry Point ---
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint2 screenDims;
+    Result.GetDimensions(screenDims.x, screenDims.y);
+    
+    // Create a unique random state for each pixel, which also changes per frame
+    uint rand_state = id.x + id.y * screenDims.x + wang_hash(_FrameIndex);
+
+    float3 accumulatedColor = float3(0, 0, 0);
+    for (int i = 0; i < _SamplesPerPixel; i++)
+    {
+        float2 jitter = float2(NextRand(rand_state), NextRand(rand_state));
+        float2 uv = (id.xy + jitter) / (float2)screenDims * 2.0 - 1.0;
+        Ray ray = CreateCameraRay(uv);
+        accumulatedColor += PathTrace(ray, id.xy, rand_state);
+    }
+
+    float3 finalColor = accumulatedColor / _SamplesPerPixel;
+
+    // Temporal accumulation
+    if (_FrameIndex > 0)
+    {
+        float3 prevAvg = Result[id.xy].rgb;
+        float t = 1.0f / (_FrameIndex + 1.0f);
+        finalColor = lerp(prevAvg, finalColor, t);
+    }
+
+    Result[id.xy] = float4(finalColor, 1.0);
+    // Denoiser still not implemented, so we just write the final color
+    // Spatial denoiser can be added later, but for now keep it simple and working even this code is not optimized for performance and kinda suck -_-
+}
