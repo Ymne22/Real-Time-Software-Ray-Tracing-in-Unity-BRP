@@ -1,12 +1,12 @@
 # Real-Time Software Ray Tracing in Unity BRP
 
-**Tech Stack**: C#, HLSL (Compute Shaders)
-
 ---
 
 ![Ray Traced Scene](Screenshots/Screenshot_1.png)
 
 **Engine**: Unity 6 Build-in Render Pipeline
+
+**Tech Stack**: C#, HLSL (Compute Shaders)
 
 ## Abstract
 
