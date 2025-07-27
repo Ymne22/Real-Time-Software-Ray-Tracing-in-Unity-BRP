@@ -2,15 +2,13 @@
 
 ---
 
-![Ray Traced Scene](Screenshots/Screenshot_1.png)
+<div align="center">
+  <img src="Screenshots/Screenshot_1.gif" alt="Preview 1"/>
+</div>
 
-**Engine**: Unity 6 Build-in Render Pipeline
+## Summary
 
-**Tech Stack**: C#, HLSL (Compute Shaders)
-
-## Abstract
-
-This project explores a real-time **software-based ray tracer** built from scratch in Unity, leveraging compute shaders instead of relying on hardware-accelerated ray tracing APIs. It implements spatial acceleration with a Bounding Volume Hierarchy (BVH), recursive light transport including reflections and indirect lighting, and a procedural sky.
+This project explores a real-time **software-based ray tracer** built from scratch in Unity, leveraging compute shaders instead of relying on hardware-accelerated ray tracing APIs. It implements a simple Bounding Volume Hierarchy (BVH), recursive light transport including reflections and indirect lighting, and a procedural sky.
 
 ---
 
